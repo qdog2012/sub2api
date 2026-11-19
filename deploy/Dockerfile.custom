@@ -1,0 +1,76 @@
+# =============================================================================
+# Sub2API - 自定义分支镜像（my-main）
+# =============================================================================
+# 这个 Dockerfile 只负责「打包」，不负责编译。
+# 编译在宿主机（Windows/WSL 或任意有 Go+Node 的机器）上完成：
+#
+#   1) 前端：pnpm --dir frontend install --frozen-lockfile
+#            pnpm --dir frontend run build          -> backend/internal/web/dist
+#   2) 后端：CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+#              -tags embed -trimpath \
+#              -ldflags="-s -w -X main.Version=... -X main.Commit=... -X main.Date=... -X main.BuildType=release" \
+#              -o bin/server-linux-amd64 ./cmd/server
+#
+# 然后把产物打包成镜像，推到服务器上跑。
+#
+# 构建命令（在仓库根目录执行）：
+#   docker build -f deploy/Dockerfile.custom \
+#     -t sub2api:latest -t sub2api:0.2.23 .
+# =============================================================================
+
+ARG ALPINE_IMAGE=alpine:3.21
+ARG POSTGRES_IMAGE=postgres:18-alpine
+
+FROM ${POSTGRES_IMAGE} AS pg-client
+
+FROM ${ALPINE_IMAGE}
+
+LABEL maintainer="nick"
+LABEL description="Sub2API - custom build from my-main branch"
+
+# 运行时依赖（与官方 Dockerfile.goreleaser 保持一致）
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    curl \
+    su-exec \
+    libpq \
+    zstd-libs \
+    lz4-libs \
+    krb5-libs \
+    libldap \
+    libedit \
+    && rm -rf /var/cache/apk/*
+
+# 从同版本 postgres 镜像取备份/恢复工具，保证与 docker-compose 里的 PG 版本一致
+COPY --from=pg-client /usr/local/bin/pg_dump /usr/local/bin/pg_dump
+COPY --from=pg-client /usr/local/bin/psql /usr/local/bin/psql
+COPY --from=pg-client /usr/local/lib/libpq.so.5* /usr/local/lib/
+
+# 非 root 用户
+RUN addgroup -g 1000 sub2api && \
+    adduser -u 1000 -G sub2api -s /bin/sh -D sub2api
+
+WORKDIR /app
+
+# 预编译好的二进制（前端已通过 -tags embed 打进二进制）
+COPY backend/bin/server-linux-amd64 /app/sub2api
+RUN chmod +x /app/sub2api
+
+# 运行时兜底资源（模型价格表等）
+COPY backend/resources /app/resources
+
+# 数据目录（config.yaml 会在这里自动生成）
+RUN mkdir -p /app/data && chown -R sub2api:sub2api /app
+
+# 入口脚本：修正卷权限后降权到 sub2api 运行
+COPY deploy/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -fsS -o /dev/null http://localhost:${SERVER_PORT:-8080}/health || exit 1
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["/app/sub2api"]

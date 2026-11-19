@@ -1,0 +1,187 @@
+# =============================================================================
+# Sub2API - 从仓库源码构建部署（自定义分支 my-main）
+# =============================================================================
+# 与 docker-compose.yml 的唯一区别：sub2api 服务不拉取官方镜像，
+# 而是用 deploy/Dockerfile.custom 就地构建，二进制来自你的分支。
+#
+# 用法（在仓库根目录）：
+#   cp deploy/.env.example deploy/.env   # 然后按需修改
+#   docker compose -f deploy/docker-compose.custom.yml up -d --build
+#
+# 更新程序：
+#   git pull && (重新编译) && docker compose -f deploy/docker-compose.custom.yml up -d --build
+#
+# 数据库数据在命名卷 postgres_data 里，重建镜像不会丢数据。
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # Sub2API 应用（本地构建）
+  # ===========================================================================
+  sub2api:
+    build:
+      context: ..                                  # 仓库根目录
+      dockerfile: deploy/Dockerfile.custom
+    image: sub2api-custom:latest
+    container_name: sub2api
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${SERVER_PORT:-8080}:8080"
+    volumes:
+      # 数据持久化（config.yaml 会自动生成在这里）
+      - sub2api_data:/app/data
+      # 可选：挂载自定义 config.yaml（先用 config.example.yaml 复制修改）
+      # - ../config.yaml:/app/data/config.yaml
+    environment:
+      - AUTO_SETUP=true
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - SERVER_MODE=${SERVER_MODE:-release}
+      - ENABLE_SERVER_TIMING=${ENABLE_SERVER_TIMING:-false}
+      - MCP_PUBLIC_URL=${MCP_PUBLIC_URL:-}
+      - RUN_MODE=${RUN_MODE:-standard}
+      - SIMPLE_MODE_AUTO_CREATE_DEFAULT_GROUPS=${SIMPLE_MODE_AUTO_CREATE_DEFAULT_GROUPS:-}
+      - SIMPLE_MODE_KEY_RATE_LIMIT_ENABLED=${SIMPLE_MODE_KEY_RATE_LIMIT_ENABLED:-false}
+      - UPDATE_GITHUB_TOKEN=${UPDATE_GITHUB_TOKEN:-}
+
+      # ---- PostgreSQL ----
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_USER=${POSTGRES_USER:-sub2api}
+      - DATABASE_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - DATABASE_DBNAME=${POSTGRES_DB:-sub2api}
+      - DATABASE_SSLMODE=disable
+      - DATABASE_MAX_OPEN_CONNS=${DATABASE_MAX_OPEN_CONNS:-50}
+      - DATABASE_MAX_IDLE_CONNS=${DATABASE_MAX_IDLE_CONNS:-10}
+
+      # ---- Redis ----
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_DB=${REDIS_DB:-0}
+
+      # ---- 管理员账号（首次启动自动创建）----
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+
+      # ---- JWT / TOTP（务必固定，否则重启后登录态与 2FA 失效）----
+      - JWT_SECRET=${JWT_SECRET:-}
+      - JWT_EXPIRE_HOUR=${JWT_EXPIRE_HOUR:-24}
+      - TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY:-}
+
+      # ---- 时区 ----
+      - TZ=${TZ:-Asia/Shanghai}
+
+      # ---- 安全（URL 白名单）----
+      - SECURITY_URL_ALLOWLIST_ENABLED=${SECURITY_URL_ALLOWLIST_ENABLED:-false}
+      - SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP=${SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP:-true}
+      - SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS=${SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS:-true}
+      - SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS=${SECURITY_URL_ALLOWLIST_UPSTREAM_HOSTS:-}
+
+      # ---- 在线更新代理 ----
+      - UPDATE_PROXY_URL=${UPDATE_PROXY_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - sub2api-network
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # ===========================================================================
+  # PostgreSQL
+  # ===========================================================================
+  postgres:
+    image: postgres:18-alpine
+    container_name: sub2api-postgres
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    command: >
+      postgres
+      -c max_connections=${POSTGRES_MAX_CONNECTIONS:-100}
+      -c shared_buffers=${POSTGRES_SHARED_BUFFERS:-128MB}
+      -c effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-4GB}
+      -c maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-64MB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - PGDATA=/var/lib/postgresql/data
+      - POSTGRES_USER=${POSTGRES_USER:-sub2api}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - POSTGRES_DB=${POSTGRES_DB:-sub2api}
+      - TZ=${TZ:-Asia/Shanghai}
+    networks:
+      - sub2api-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-sub2api} -d ${POSTGRES_DB:-sub2api} && psql -U ${POSTGRES_USER:-sub2api} -d ${POSTGRES_DB:-sub2api} -Atqc 'SELECT 1' >/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+
+  # ===========================================================================
+  # Redis
+  # ===========================================================================
+  redis:
+    image: redis:8-alpine
+    container_name: sub2api-redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    volumes:
+      - redis_data:/data
+    command:
+      - redis-server
+      - --save
+      - "60"
+      - "1"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --requirepass
+      - ${REDIS_PASSWORD:-}
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - REDISCLI_AUTH=${REDIS_PASSWORD:-}
+    networks:
+      - sub2api-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  sub2api_data:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  sub2api-network:
+    driver: bridge
